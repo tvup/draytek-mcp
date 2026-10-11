@@ -1,0 +1,27 @@
+{
+  "name": "draytek-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for full configuration of Draytek Vigor2927 (DrayOS) routers via SSH CLI",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "draytek-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test:connection": "tsx src/test-connection.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "ssh2": "^1.17.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/ssh2": "^1.15.6",
+    "tsx": "^4.19.4",
+    "typescript": "^5.7.3"
+  }
+}
