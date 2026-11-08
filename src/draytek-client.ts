@@ -14,6 +14,31 @@ export interface DraytekConfig {
 
 const MORE_PATTERN = /--- MORE ---.*---\s*$/;
 
+/** Close the SSH session after this long without commands, so other clients can log in. */
+const IDLE_DISCONNECT_MS = 10_000;
+/** How long to keep retrying while another client holds the router's only SSH slot. */
+const BUSY_RETRY_MS = 25_000;
+
+/**
+ * The router allows one SSH session. While it is taken, it answers with
+ * "No connection is available now. Try again later!" instead of an SSH banner,
+ * which ssh2 reports as a header error or a connection lost before the handshake.
+ */
+export class RouterBusyError extends Error {
+  constructor(cause: Error) {
+    super(
+      "Router refused the SSH connection: it allows only one SSH session at a time, " +
+      "and another client (e.g. another draytek-mcp instance or an open SSH/telnet login) is using it. " +
+      `Try again shortly. (${cause.message})`
+    );
+    this.name = "RouterBusyError";
+  }
+}
+
+function isBusyError(err: Error): boolean {
+  return /Invalid header|expected newline|before handshake|No connection is available/i.test(err.message);
+}
+
 /** Raised when the router does not return a prompt in time. */
 export class PromptTimeoutError extends Error {
   constructor(public readonly received: string, timeoutMs: number) {
@@ -35,6 +60,9 @@ export class DraytekClient {
   private connecting: Promise<void> | null = null;
   /** Serialises commands: they share one shell and one buffer. */
   private queue: Promise<unknown> = Promise.resolve();
+  /** Commands queued or running; the session is released when this reaches 0. */
+  private pending = 0;
+  private idleTimer: NodeJS.Timeout | undefined;
 
   constructor(config: DraytekConfig) {
     this.config = { port: 22, ...config };
@@ -50,11 +78,27 @@ export class DraytekClient {
   async connect(): Promise<void> {
     if (this.shell) return;
     if (!this.connecting) {
-      this.connecting = this.openSession().finally(() => {
+      this.connecting = this.openSessionWhenFree().finally(() => {
         this.connecting = null;
       });
     }
     return this.connecting;
+  }
+
+  /** Open a session, waiting with backoff while another client holds the router's only SSH slot. */
+  private async openSessionWhenFree(): Promise<void> {
+    const deadline = Date.now() + BUSY_RETRY_MS;
+    let delay = 1_000;
+    for (;;) {
+      try {
+        return await this.openSession();
+      } catch (err) {
+        if (!(err instanceof RouterBusyError)) throw err;
+        if (Date.now() + delay > deadline) throw err;
+        await new Promise((r) => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 5_000);
+      }
+    }
   }
 
   private async openSession(): Promise<void> {
@@ -98,7 +142,8 @@ export class DraytekClient {
       });
 
       conn.on("error", (err) => {
-        fail(hostMismatchMsg ? new Error(hostMismatchMsg) : err);
+        if (hostMismatchMsg) return fail(new Error(hostMismatchMsg));
+        fail(isBusyError(err) ? new RouterBusyError(err) : err);
       });
 
       // Link drop, router reboot or idle timeout: forget the session so the next call reconnects.
@@ -256,7 +301,15 @@ export class DraytekClient {
     if (/[\x00-\x1f\x7f]/.test(command)) {
       throw new Error("Command contains illegal control characters");
     }
-    const run = this.queue.then(() => this.executeWithRetry(command, timeoutMs));
+    clearTimeout(this.idleTimer);
+    this.pending++;
+    const run = this.queue
+      .then(() => this.executeWithRetry(command, timeoutMs))
+      .finally(() => {
+        if (--this.pending === 0) {
+          this.idleTimer = setTimeout(() => void this.disconnect(), IDLE_DISCONNECT_MS);
+        }
+      });
     this.queue = run.catch(() => undefined);
     return run;
   }
